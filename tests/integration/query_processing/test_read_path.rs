@@ -2,8 +2,12 @@ use crate::assertions::{AssertColumn, Cell};
 use crate::common::{limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
 use asserting::prelude::*;
 use rusqlite::Connection as SqliteConnection;
+use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::{LimboError, StepResult, Value};
+use turso_core::{
+    Connection, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, LimboError, OpenFlags,
+    PlatformIO, SqliteDialect, Statement, StepResult, Value,
+};
 
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
 fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -81,6 +85,299 @@ fn recursive_cte_explain_query_plan_shows_setup_and_recursive_step(
         .contains("SETUP")
         .contains("RECURSIVE STEP");
     Ok(())
+}
+
+#[turso_macros::test(encryption)]
+fn recursive_cte_lists_a_group_and_its_descendants() {
+    let (_dir, conn) = open_tree(encrypted);
+    let mut stmt = conn
+        .prepare(
+            "WITH RECURSIVE sub(id) AS (
+                SELECT id FROM t WHERE id = ?
+                UNION
+                SELECT t.id FROM t JOIN sub ON t.parent_id = sub.id
+            )
+            SELECT id FROM t WHERE id IN (SELECT id FROM sub) ORDER BY id",
+        )
+        .unwrap();
+    assert_that!(run_with_params(&mut stmt, &[Value::build_text("a")])).is_equal_to(vec![
+        row!["a"],
+        row!["a1"],
+        row!["a11"],
+        row!["a2"],
+    ]);
+    assert_that!(run_with_params(&mut stmt, &[Value::build_text("root")])).is_equal_to(vec![
+        row!["a"],
+        row!["a1"],
+        row!["a11"],
+        row!["a2"],
+        row!["b"],
+        row!["b1"],
+        row!["root"],
+    ]);
+    assert_that!(run_with_params(&mut stmt, &[Value::build_text("a11")]))
+        .is_equal_to(vec![row!["a11"]]);
+    assert_that!(run_with_params(&mut stmt, &[Value::build_text("missing")])).is_empty();
+}
+
+#[turso_macros::test(encryption)]
+fn recursive_cte_filters_a_larger_query_to_a_group_and_its_descendants() {
+    let (_dir, conn) = open_tree(encrypted);
+    for sql in [
+        "WITH RECURSIVE sub(id) AS (
+            SELECT id FROM t WHERE id = ?
+            UNION
+            SELECT t.id FROM t JOIN sub ON t.parent_id = sub.id
+        )
+        SELECT t.id, parent.id
+        FROM t LEFT JOIN t AS parent ON parent.id = t.parent_id
+        WHERE t.amount > ? AND t.id IN (SELECT id FROM sub)
+        ORDER BY t.amount DESC
+        LIMIT ? OFFSET ?",
+        "SELECT t.id, parent.id
+        FROM t LEFT JOIN t AS parent ON parent.id = t.parent_id
+        WHERE t.id IN (
+            WITH RECURSIVE sub(id) AS (
+                SELECT id FROM t WHERE id = ?
+                UNION
+                SELECT t.id FROM t JOIN sub ON t.parent_id = sub.id
+            )
+            SELECT id FROM sub
+        ) AND t.amount > ?
+        ORDER BY t.amount DESC
+        LIMIT ? OFFSET ?",
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        assert_that!(run_with_params(
+            &mut stmt,
+            &[
+                Value::build_text("root"),
+                Value::from_i64(3),
+                Value::from_i64(3),
+                Value::from_i64(1),
+            ],
+        ))
+        .described_as(sql)
+        .is_equal_to(vec![row!["a2", "a"], row!["a1", "a"], row!["a", "root"]]);
+        assert_that!(run_with_params(
+            &mut stmt,
+            &[
+                Value::build_text("a"),
+                Value::from_i64(0),
+                Value::from_i64(10),
+                Value::from_i64(0),
+            ],
+        ))
+        .described_as(sql)
+        .is_equal_to(vec![
+            row!["a2", "a"],
+            row!["a1", "a"],
+            row!["a", "root"],
+            row!["a11", "a1"],
+        ]);
+        assert_that!(run_with_params(
+            &mut stmt,
+            &[
+                Value::build_text("root"),
+                Value::from_i64(3),
+                Value::from_i64(10),
+                Value::from_i64(5),
+            ],
+        ))
+        .described_as(sql)
+        .is_empty();
+    }
+}
+
+#[turso_macros::test(encryption)]
+fn recursive_cte_lists_an_entry_and_its_ancestors() {
+    let (_dir, conn) = open_tree(encrypted);
+    let mut stmt = conn
+        .prepare(
+            "WITH RECURSIVE up(id, parent_id, depth) AS (
+                SELECT id, parent_id, 0 FROM t WHERE id = ?
+                UNION ALL
+                SELECT t.id, t.parent_id, up.depth + 1 FROM t JOIN up ON t.id = up.parent_id
+            )
+            SELECT id, depth FROM up ORDER BY depth DESC",
+        )
+        .unwrap();
+    assert_that!(run_with_params(&mut stmt, &[Value::build_text("a11")])).is_equal_to(vec![
+        row!["root", 3],
+        row!["a", 2],
+        row!["a1", 1],
+        row!["a11", 0],
+    ]);
+    assert_that!(run_with_params(&mut stmt, &[Value::build_text("root")]))
+        .is_equal_to(vec![row!["root", 0]]);
+    assert_that!(run_with_params(&mut stmt, &[Value::build_text("o1")]))
+        .is_equal_to(vec![row!["other", 1], row!["o1", 0]]);
+}
+
+#[turso_macros::test(encryption)]
+fn recursive_cte_finds_whether_an_entry_is_an_ancestor_of_another() {
+    let (_dir, conn) = open_tree(encrypted);
+    let mut stmt = conn
+        .prepare(
+            "WITH RECURSIVE up(id) AS (
+                SELECT ?
+                UNION
+                SELECT t.parent_id FROM t JOIN up ON t.id = up.id WHERE t.parent_id IS NOT NULL
+            )
+            SELECT count(*) FROM up WHERE id = ?",
+        )
+        .unwrap();
+    assert_that!(run_with_params(
+        &mut stmt,
+        &[Value::build_text("a11"), Value::build_text("a")],
+    ))
+    .is_equal_to(vec![row![1]]);
+    assert_that!(run_with_params(
+        &mut stmt,
+        &[Value::build_text("a11"), Value::build_text("b")],
+    ))
+    .is_equal_to(vec![row![0]]);
+}
+
+#[turso_macros::test(encryption)]
+fn recursive_cte_union_returns_each_row_of_a_parent_cycle_once() {
+    let (_dir, conn) = open_tree(encrypted);
+    conn.execute("INSERT INTO t VALUES ('c1', 'c2', 0), ('c2', 'c1', 0), ('c3', 'c2', 0)")
+        .unwrap();
+    let mut descendants = conn
+        .prepare(
+            "WITH RECURSIVE sub(id) AS (
+                SELECT id FROM t WHERE id = ?
+                UNION
+                SELECT t.id FROM t JOIN sub ON t.parent_id = sub.id
+            )
+            SELECT id FROM sub ORDER BY id",
+        )
+        .unwrap();
+    assert_that!(run_with_params(
+        &mut descendants,
+        &[Value::build_text("c1")]
+    ))
+    .is_equal_to(vec![row!["c1"], row!["c2"], row!["c3"]]);
+    let mut ancestors = conn
+        .prepare(
+            "WITH RECURSIVE up(id) AS (
+                SELECT ?
+                UNION
+                SELECT t.parent_id FROM t JOIN up ON t.id = up.id WHERE t.parent_id IS NOT NULL
+            )
+            SELECT id FROM up ORDER BY id",
+        )
+        .unwrap();
+    assert_that!(run_with_params(&mut ancestors, &[Value::build_text("c3")])).is_equal_to(vec![
+        row!["c1"],
+        row!["c2"],
+        row!["c3"],
+    ]);
+}
+
+#[turso_macros::test(encryption)]
+fn recursive_cte_union_all_stops_a_parent_cycle_at_a_depth_limit() {
+    let (_dir, conn) = open_tree(encrypted);
+    conn.execute("INSERT INTO t VALUES ('c1', 'c2', 0), ('c2', 'c1', 0), ('c3', 'c2', 0)")
+        .unwrap();
+    let mut stmt = conn
+        .prepare(
+            "WITH RECURSIVE sub(id, depth) AS (
+                SELECT id, 0 FROM t WHERE id = ?
+                UNION ALL
+                SELECT t.id, sub.depth + 1 FROM t JOIN sub ON t.parent_id = sub.id
+                WHERE sub.depth < ?
+            )
+            SELECT id, depth FROM sub ORDER BY depth, id",
+        )
+        .unwrap();
+    assert_that!(run_with_params(
+        &mut stmt,
+        &[Value::build_text("c1"), Value::from_i64(3)],
+    ))
+    .is_equal_to(vec![
+        row!["c1", 0],
+        row!["c2", 1],
+        row!["c1", 2],
+        row!["c3", 2],
+        row!["c2", 3],
+    ]);
+}
+
+#[turso_macros::test(encryption)]
+fn recursive_cte_counts_and_sums_each_group_with_its_descendants() {
+    let (_dir, conn) = open_tree(encrypted);
+    let mut stmt = conn
+        .prepare(
+            "WITH RECURSIVE under(group_id, id) AS (
+                SELECT id, id FROM t WHERE parent_id = ?
+                UNION
+                SELECT under.group_id, t.id FROM t JOIN under ON t.parent_id = under.id
+            )
+            SELECT under.group_id, count(*), sum(t.amount)
+            FROM under JOIN t ON t.id = under.id
+            GROUP BY under.group_id
+            ORDER BY under.group_id",
+        )
+        .unwrap();
+    assert_that!(run_with_params(&mut stmt, &[Value::build_text("root")]))
+        .is_equal_to(vec![row!["a", 4, 65], row!["b", 2, 42]]);
+    assert_that!(run_with_params(&mut stmt, &[Value::build_text("a")]))
+        .is_equal_to(vec![row!["a1", 2, 25], row!["a2", 1, 30]]);
+    assert_that!(run_with_params(&mut stmt, &[Value::build_text("b1")])).is_empty();
+}
+
+const TREE_HEXKEY: &str = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+
+fn open_tree(encrypted: bool) -> (TempDir, Arc<Connection>) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("tree.db");
+    let encryption = encrypted.then(|| EncryptionOpts {
+        cipher: "aegis256".to_string(),
+        hexkey: TREE_HEXKEY.to_string(),
+    });
+    let db = Database::open_file_with_flags(
+        Arc::new(PlatformIO::new().unwrap()),
+        path.to_str().unwrap(),
+        OpenFlags::Create,
+        DatabaseOpts::new().with_encryption(true),
+        encryption,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let key = encrypted.then(|| EncryptionKey::from_hex_string(TREE_HEXKEY).unwrap());
+    let writer = db.connect_with_encryption(key.clone()).unwrap();
+    writer
+        .execute("CREATE TABLE t (id TEXT PRIMARY KEY, parent_id TEXT, amount INTEGER)")
+        .unwrap();
+    writer
+        .execute("CREATE INDEX t_parent_id ON t (parent_id)")
+        .unwrap();
+    writer
+        .execute(
+            "INSERT INTO t VALUES
+                ('root', NULL, 1),
+                ('a', 'root', 10),
+                ('a1', 'a', 20),
+                ('a11', 'a1', 5),
+                ('a2', 'a', 30),
+                ('b', 'root', 40),
+                ('b1', 'b', 2),
+                ('other', NULL, 100),
+                ('o1', 'other', 50)",
+        )
+        .unwrap();
+    (dir, db.connect_with_encryption(key).unwrap())
+}
+
+fn run_with_params(stmt: &mut Statement, params: &[Value]) -> Vec<Vec<Value>> {
+    stmt.reset().unwrap();
+    for (index, value) in params.iter().enumerate() {
+        stmt.bind_at((index + 1).try_into().unwrap(), value.clone())
+            .unwrap();
+    }
+    stmt.run_collect_rows().unwrap()
 }
 
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
