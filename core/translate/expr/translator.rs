@@ -318,12 +318,17 @@ pub fn translate_expr(
                         target_pc: label_null_result,
                     });
                     program.preassign_label_to_next_insn(label_null_checks_next);
-                    program.emit_insn(Insn::Next {
-                        cursor_id: *cursor_id,
-                        pc_if_next: label_null_checks_loop_start,
-                        fullscan: false,
-                        is_index: false,
-                    });
+                    // NULLs sort first in the ephemeral index, so with one column its first row
+                    // answers for the rest. Scanning them would make every row the set does not
+                    // hold cost as much as the whole set.
+                    if lhs_column_count > 1 {
+                        program.emit_insn(Insn::Next {
+                            cursor_id: *cursor_id,
+                            pc_if_next: label_null_checks_loop_start,
+                            fullscan: false,
+                            is_index: false,
+                        });
+                    }
                     // Loop exhausted without finding all-NULL row
                     program.emit_insn(Insn::Goto {
                         target_pc: label_on_no_null,

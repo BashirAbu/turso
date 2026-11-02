@@ -42,6 +42,83 @@ fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 #[turso_macros::test]
+fn in_subquery_answers_a_value_it_does_not_hold_as_sqlite_does(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let sqlite = SqliteConnection::open_in_memory()?;
+    let setup = [
+        "CREATE TABLE holds_null (y)",
+        "INSERT INTO holds_null VALUES (1), (NULL), ('b'), (3.5), (x'00')",
+        "CREATE TABLE holds_none (y)",
+        "INSERT INTO holds_none VALUES (1), ('b')",
+        "CREATE TABLE holds_nothing (y)",
+    ];
+    for sql in setup {
+        conn.execute(sql)?;
+        sqlite.execute(sql, [])?;
+    }
+    let values = ["1", "2", "'b'", "'c'", "3.5", "x'00'", "x'01'", "NULL"];
+    let sets = ["holds_null", "holds_none", "holds_nothing"];
+    for value in values {
+        for set in sets {
+            for op in ["IN", "NOT IN"] {
+                let sql = format!("SELECT {value} {op} (SELECT y FROM {set})");
+                assert_eq!(
+                    limbo_exec_rows(&conn, &sql),
+                    sqlite_exec_rows(&sqlite, &sql),
+                    "{sql}"
+                );
+            }
+        }
+    }
+    // More than one column still looks at every row: a NULL is not first among them all.
+    for sql in [
+        "SELECT (2, 1) IN (SELECT 1, 1 UNION ALL SELECT NULL, NULL)",
+        "SELECT (2, 1) NOT IN (SELECT 1, 1 UNION ALL SELECT 3, 3)",
+        "SELECT (1, 1) IN (SELECT 1, 1 UNION ALL SELECT NULL, NULL)",
+    ] {
+        assert_eq!(
+            limbo_exec_rows(&conn, sql),
+            sqlite_exec_rows(&sqlite, sql),
+            "{sql}"
+        );
+    }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn in_subquery_does_not_scan_its_set_for_each_value_it_does_not_hold(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE outer_rows (x INTEGER)")?;
+    conn.execute("CREATE TABLE set_rows (y INTEGER)")?;
+    conn.execute("BEGIN")?;
+    for i in 0..1000 {
+        conn.execute(format!("INSERT INTO outer_rows VALUES ({i})"))?;
+        conn.execute(format!("INSERT INTO set_rows VALUES ({})", i + 1_000_000))?;
+    }
+    conn.execute("COMMIT")?;
+
+    let steps = |sql: &str| -> anyhow::Result<u64> {
+        let mut stmt = conn.prepare(sql)?;
+        stmt.run_ignore_rows()?;
+        Ok(stmt.metrics().vm_steps)
+    };
+    let of_one =
+        steps("SELECT count(*) FROM outer_rows WHERE x IN (SELECT y FROM set_rows LIMIT 1)")?;
+    let of_all = steps("SELECT count(*) FROM outer_rows WHERE x IN (SELECT y FROM set_rows)")?;
+    // Filling the set costs steps for each of its rows; checking against it costs none more. A scan
+    // for a NULL would cost a thousand rows' steps for each of a thousand values.
+    assert!(
+        of_all < of_one + 50_000,
+        "{of_all} steps with the whole set, {of_one} with one row"
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
 fn recursive_cte_with_bound_termination_predicate(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     let mut stmt = conn.prepare(
