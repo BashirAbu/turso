@@ -1898,3 +1898,30 @@ fn test_upsert_do_update_failure_preserves_indexes(tmp_db: TempDatabase) -> anyh
 
     Ok(())
 }
+
+#[turso_macros::test]
+fn a_target_with_capitals_in_its_name_can_be_named(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE Terms (id INTEGER PRIMARY KEY, deployment INTEGER, customer TEXT)")?;
+    conn.execute("CREATE TABLE deployments (id INTEGER PRIMARY KEY, customer TEXT)")?;
+    conn.execute("INSERT INTO deployments VALUES (1, 'huda'), (2, 'omar')")?;
+    conn.execute("INSERT INTO Terms VALUES (10, 1, NULL), (20, 2, NULL), (30, 1, 'kept')")?;
+
+    // SQLite folds the case of a name that qualifies a column, whatever it is qualified by: the
+    // target of an UPDATE or a DELETE too, in a subquery of its SET, in its WHERE, in RETURNING.
+    conn.execute(
+        "UPDATE Terms SET customer = (SELECT d.customer FROM deployments AS d WHERE d.id = Terms.deployment)
+         WHERE Terms.customer IS NULL",
+    )?;
+    let rows = limbo_exec_rows(&conn, "SELECT id, customer FROM terms ORDER BY id");
+    assert_that!(rows).is_equal_to(vec![row![10, "huda"], row![20, "omar"], row![30, "kept"]]);
+
+    let returned = limbo_exec_rows(&conn, "UPDATE \"Terms\" SET id = 40 WHERE id = 30 RETURNING \"Terms\".customer");
+    assert_that!(returned).is_equal_to(vec![row!["kept"]]);
+
+    let returned = limbo_exec_rows(&conn, "DELETE FROM Terms WHERE Terms.customer = 'omar' RETURNING Terms.id");
+    assert_that!(returned).is_equal_to(vec![row![20]]);
+    let rows = limbo_exec_rows(&conn, "SELECT id FROM terms ORDER BY id");
+    assert_that!(rows).is_equal_to(vec![row![10], row![40]]);
+    Ok(())
+}

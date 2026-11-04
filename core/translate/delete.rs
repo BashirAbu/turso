@@ -209,7 +209,7 @@ pub fn prepare_delete_plan(
     let joined_tables = vec![JoinedTable {
         op: Operation::default_scan_for(&table),
         table,
-        identifier: qualified_name.identifier(),
+        identifier: normalize_ident(&qualified_name.identifier()),
         internal_id: program.table_reference_counter.next(),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
